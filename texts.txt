@@ -1,0 +1,297 @@
+// ra2_main_windows.c
+// RA2 - Cache de Textos (Windows version)
+// Implementa FIFO, LRU, LFU com cache de 10 textos entre 100 arquivos simulados.
+// Compatível com Windows (usa Sleep e QueryPerformanceCounter).
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <windows.h>  // para Sleep() e alta resolução de tempo
+
+#define NUM_TEXTS 100
+#define CACHE_SIZE 10
+#define SIM_USERS 3
+#define SIM_REQUESTS_PER_USER 200
+
+#define DISK_READ_MS 120     // 120 ms para leitura "de disco"
+#define CACHE_READ_MS 5      // 5 ms para leitura "em cache"
+
+typedef enum { ALGO_FIFO=0, ALGO_LRU=1, ALGO_LFU=2 } algo_t;
+
+typedef struct cache_entry {
+    int text_id;
+    char *content;
+    int freq;
+    struct cache_entry *prev, *next;
+} cache_entry_t;
+
+typedef struct {
+    cache_entry_t *head, *tail;
+    int size;
+    cache_entry_t *map[NUM_TEXTS+1];
+} cache_t;
+
+typedef struct {
+    unsigned long long hits;
+    unsigned long long misses;
+    unsigned long long total_time_us;
+    unsigned long long per_text_miss_count[NUM_TEXTS+1];
+} stats_t;
+
+/* ======= Funções auxiliares ======= */
+
+unsigned long long now_us() {
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (unsigned long long)((counter.QuadPart * 1000000ULL) / freq.QuadPart);
+}
+
+void sleep_us(unsigned long us) {
+    Sleep(us / 1000); // Sleep trabalha em milissegundos
+}
+
+/* ======= Cache ======= */
+
+void cache_init(cache_t *c) {
+    c->head = c->tail = NULL;
+    c->size = 0;
+    for (int i=0; i<=NUM_TEXTS; i++) c->map[i] = NULL;
+}
+
+void cache_free(cache_t *c) {
+    cache_entry_t *cur = c->head;
+    while (cur) {
+        cache_entry_t *n = cur->next;
+        if (cur->content) free(cur->content);
+        free(cur);
+        cur = n;
+    }
+}
+
+void cache_insert_front(cache_t *c, cache_entry_t *e) {
+    e->prev = NULL;
+    e->next = c->head;
+    if (c->head) c->head->prev = e;
+    c->head = e;
+    if (!c->tail) c->tail = e;
+    c->map[e->text_id] = e;
+    c->size++;
+}
+
+void cache_remove(cache_t *c, cache_entry_t *e) {
+    if (!e) return;
+    if (e->prev) e->prev->next = e->next;
+    else c->head = e->next;
+    if (e->next) e->next->prev = e->prev;
+    else c->tail = e->prev;
+    c->map[e->text_id] = NULL;
+    c->size--;
+}
+
+void cache_move_to_front(cache_t *c, cache_entry_t *e) {
+    if (c->head == e) return;
+    cache_remove(c, e);
+    cache_insert_front(c, e);
+}
+
+cache_entry_t* cache_evict_fifo(cache_t *c) {
+    if (!c->tail) return NULL;
+    cache_entry_t *vict = c->tail;
+    cache_remove(c, vict);
+    return vict;
+}
+
+cache_entry_t* cache_evict_lru(cache_t *c) {
+    return cache_evict_fifo(c);
+}
+
+cache_entry_t* cache_evict_lfu(cache_t *c) {
+    if (!c->head) return NULL;
+    int minf = 999999;
+    cache_entry_t *cur = c->head, *vict = NULL;
+    while (cur) {
+        if (cur->freq <= minf) {
+            minf = cur->freq;
+            vict = cur;
+        }
+        cur = cur->next;
+    }
+    if (vict) cache_remove(c, vict);
+    return vict;
+}
+
+/* ======= Simula leitura de disco ======= */
+char* read_text_from_disk(int id, unsigned long long *elapsed_us) {
+    unsigned long long t0 = now_us();
+    char path[256];
+    sprintf(path, "texts/%d.txt", id);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        sleep_us(DISK_READ_MS * 1000);
+        unsigned long long t1 = now_us();
+        *elapsed_us = t1 - t0;
+        char *buf = malloc(64);
+        sprintf(buf, "Texto simulado %d\n", id);
+        return buf;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz + 1);
+    fread(buf, 1, sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+    Sleep(DISK_READ_MS);
+    unsigned long long t1 = now_us();
+    *elapsed_us = t1 - t0;
+    return buf;
+}
+
+/* ======= Acesso ao cache ======= */
+char* cache_access(cache_t *c, int id, algo_t algo, stats_t *st) {
+    unsigned long long t0 = now_us();
+    cache_entry_t *e = c->map[id];
+    if (e) {
+        st->hits++;
+        sleep_us(CACHE_READ_MS * 1000);
+        if (algo == ALGO_LRU) cache_move_to_front(c, e);
+        if (algo == ALGO_LFU) { e->freq++; cache_move_to_front(c, e); }
+        unsigned long long t1 = now_us();
+        st->total_time_us += (t1 - t0);
+        return strdup(e->content);
+    }
+    st->misses++;
+    st->per_text_miss_count[id]++;
+    unsigned long long disk_us;
+    char *content = read_text_from_disk(id, &disk_us);
+    if (c->size >= CACHE_SIZE) {
+        cache_entry_t *vict = NULL;
+        if (algo == ALGO_FIFO) vict = cache_evict_fifo(c);
+        else if (algo == ALGO_LRU) vict = cache_evict_lru(c);
+        else vict = cache_evict_lfu(c);
+        if (vict) { free(vict->content); free(vict); }
+    }
+    cache_entry_t *ne = malloc(sizeof(cache_entry_t));
+    ne->text_id = id;
+    ne->content = strdup(content);
+    ne->freq = 1;
+    ne->prev = ne->next = NULL;
+    cache_insert_front(c, ne);
+    unsigned long long t1 = now_us();
+    st->total_time_us += (t1 - t0);
+    return content;
+}
+
+/* ======= Estatísticas ======= */
+void stats_init(stats_t *s) {
+    s->hits = s->misses = 0;
+    s->total_time_us = 0;
+    for (int i=0;i<=NUM_TEXTS;i++) s->per_text_miss_count[i]=0;
+}
+
+/* ======= Distribuições ======= */
+int pick_uniform() { return (rand() % NUM_TEXTS) + 1; }
+
+int pick_poisson() {
+    const double lambda = 30.0;
+    double L = exp(-lambda);
+    int k = 0; double p = 1.0;
+    do { k++; p *= (double)rand() / RAND_MAX; } while (p > L && k < 1000);
+    return ((k-1) % NUM_TEXTS) + 1;
+}
+
+int pick_weighted_43_30_40() {
+    double r = (double)rand() / RAND_MAX;
+    if (r < 0.43) return 30 + (rand() % 11);
+    int v;
+    do { v = (rand() % NUM_TEXTS) + 1; } while (v >= 30 && v <= 40);
+    return v;
+}
+
+/* ======= Simulação ======= */
+void run_sim(algo_t algo, int (*picker)(), const char *dist, const char *algoname) {
+    cache_t cache;
+    stats_t st;
+    cache_init(&cache);
+    stats_init(&st);
+    unsigned long long start = now_us();
+    for (int u=0; u<SIM_USERS; u++) {
+        for (int r=0; r<SIM_REQUESTS_PER_USER; r++) {
+            int id = picker();
+            char *c = cache_access(&cache, id, algo, &st);
+            free(c);
+        }
+    }
+    unsigned long long end = now_us();
+    double sec = (end - start) / 1e6;
+    printf("Simulação %s/%s: hits=%llu misses=%llu tempo=%.2fs\n",
+           algoname, dist,
+           st.hits, st.misses, sec);
+
+    char csvname[128];
+    sprintf(csvname, "sim_%s_%s.csv", algoname, dist);
+    FILE *f = fopen(csvname, "w");
+    if (f) {
+        fprintf(f, "text_id,miss_count\n");
+        for (int i=1;i<=NUM_TEXTS;i++)
+            fprintf(f, "%d,%llu\n", i, st.per_text_miss_count[i]);
+        fclose(f);
+    }
+    cache_free(&cache);
+}
+
+/* ======= Loop interativo ======= */
+void interactive_loop() {
+    printf("=== RA2 Cache (Windows) ===\n");
+    srand((unsigned)time(NULL));
+
+    int algo_choice;
+    printf("Escolha o algoritmo: 0=FIFO 1=LRU 2=LFU\n> ");
+    scanf("%d", &algo_choice);
+    if (algo_choice < 0 || algo_choice > 2) algo_choice = 0;
+
+    cache_t cache; stats_t st;
+    cache_init(&cache); stats_init(&st);
+
+    while (1) {
+        printf("\nDigite o número do texto (1..100), 0=sair, -1=simulação: ");
+        int id; scanf("%d", &id);
+        if (id == 0) break;
+        if (id == -1) {
+            run_sim(ALGO_FIFO, pick_uniform, "uniform", "FIFO");
+            run_sim(ALGO_FIFO, pick_weighted_43_30_40, "weighted", "FIFO");
+            run_sim(ALGO_FIFO, pick_poisson, "poisson", "FIFO");
+            run_sim(ALGO_LRU, pick_uniform, "uniform", "LRU");
+            run_sim(ALGO_LRU, pick_weighted_43_30_40, "weighted", "LRU");
+            run_sim(ALGO_LRU, pick_poisson, "poisson", "LRU");
+            run_sim(ALGO_LFU, pick_uniform, "uniform", "LFU");
+            run_sim(ALGO_LFU, pick_weighted_43_30_40, "weighted", "LFU");
+            run_sim(ALGO_LFU, pick_poisson, "poisson", "LFU");
+            continue;
+        }
+
+        if (id < 1 || id > NUM_TEXTS) {
+            printf("ID inválido!\n");
+            continue;
+        }
+
+        char *c = cache_access(&cache, id, (algo_t)algo_choice, &st);
+        printf("\n--- Texto %d ---\n", id);
+        printf("%.1000s\n", c);
+        free(c);
+
+        printf("[Estatísticas] hits=%llu misses=%llu tempo médio=%.3f ms\n",
+               st.hits, st.misses,
+               (double)st.total_time_us / 1000.0 / (st.hits + st.misses));
+    }
+
+    cache_free(&cache);
+}
+
+/* ======= Main ======= */
+int main() {
+    interactive_loop();
+    return 0;
+}
